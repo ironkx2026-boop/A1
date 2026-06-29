@@ -123,7 +123,11 @@ static RenderDevice create_device() {
     check(hr, "D3D11CreateDevice failed");
 
     D2D1_FACTORY_OPTIONS factoryOptions{};
-    check(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factoryOptions, &device.d2dFactory),
+    check(D2D1CreateFactory(
+        D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        __uuidof(ID2D1Factory3),
+        &factoryOptions,
+        reinterpret_cast<void**>(device.d2dFactory.GetAddressOf())),
         "D2D1CreateFactory failed");
 
     check(device.d3d.As(&device.dxgiDevice), "Query IDXGIDevice failed");
