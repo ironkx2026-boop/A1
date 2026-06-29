@@ -1,0 +1,21 @@
+Command-line contract used by GPU_001.pyw
+
+Required arguments:
+
+--input <pdf-path>
+--output <output-folder>
+--dpi <integer>
+--prefix <filename-prefix>
+
+Behavior:
+
+- Create the output folder if needed.
+- Render every PDF page.
+- Save PNG files as <prefix>0001.png, <prefix>0002.png, ...
+- Print progress lines to stdout, one per page.
+- Return exit code 0 on success.
+- Return non-zero on failure.
+
+Example:
+
+GpuPdfRenderer.exe --input "C:\PROJECTS\OCR\sample.pdf" --output "C:\PROJECTS\OCR\GPU_test_output" --dpi 300 --prefix "sample_page_"

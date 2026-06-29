@@ -1,0 +1,307 @@
+import queue
+import shutil
+import subprocess
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+
+APP_DIR = Path(__file__).resolve().parent
+LOCAL_MUTOOL = APP_DIR / "MuPDF" / "mutool.exe"
+LOCAL_D2D_RENDERER = APP_DIR / "Direct2DRenderer" / "GpuPdfRenderer.exe"
+
+
+class PdfToPngApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("PDF to PNG - GPU_001")
+        self.geometry("780x520")
+        self.minsize(720, 480)
+
+        self.pdf_path = tk.StringVar()
+        self.output_dir = tk.StringVar()
+        self.dpi = tk.IntVar(value=300)
+        self.status = tk.StringVar(value="Select a PDF and an output folder.")
+        self.gpu_status = tk.StringVar(value=self.detect_hardware_text())
+
+        self.worker = None
+        self.process = None
+        self.cancel_requested = False
+        self.events = queue.Queue()
+        self.started_at = None
+
+        self.create_widgets()
+        self.after(100, self.poll_events)
+
+    def create_widgets(self):
+        root = ttk.Frame(self, padding=16)
+        root.pack(fill=tk.BOTH, expand=True)
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(6, weight=1)
+
+        title = ttk.Label(root, text="Convert every PDF page to PNG", font=("Segoe UI", 16, "bold"))
+        title.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
+
+        ttk.Label(root, text="PDF file").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(root, textvariable=self.pdf_path).grid(row=1, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Button(root, text="Select PDF", command=self.select_pdf).grid(row=1, column=2, sticky="ew", pady=6)
+
+        ttk.Label(root, text="Output folder").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(root, textvariable=self.output_dir).grid(row=2, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Button(root, text="Select Folder", command=self.select_output_dir).grid(row=2, column=2, sticky="ew", pady=6)
+
+        ttk.Label(root, text="Resolution").grid(row=3, column=0, sticky="w", pady=6)
+        dpi_frame = ttk.Frame(root)
+        dpi_frame.grid(row=3, column=1, sticky="w", padx=8, pady=6)
+        ttk.Spinbox(dpi_frame, from_=72, to=600, increment=25, textvariable=self.dpi, width=8).pack(side=tk.LEFT)
+        ttk.Label(dpi_frame, text="DPI").pack(side=tk.LEFT, padx=(8, 0))
+
+        ttk.Label(root, text="Hardware").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Label(root, textvariable=self.gpu_status).grid(row=4, column=1, columnspan=2, sticky="w", padx=8, pady=6)
+
+        button_frame = ttk.Frame(root)
+        button_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 8))
+        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_conversion)
+        self.start_button.pack(side=tk.LEFT)
+        self.cancel_button = ttk.Button(button_frame, text="Cancel", command=self.cancel_conversion, state=tk.DISABLED)
+        self.cancel_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.progress = ttk.Progressbar(root, mode="indeterminate")
+        self.progress.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+
+        ttk.Label(root, textvariable=self.status).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        self.log = tk.Text(root, height=12, wrap=tk.WORD, state=tk.DISABLED)
+        self.log.grid(row=8, column=0, columnspan=3, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(root, orient=tk.VERTICAL, command=self.log.yview)
+        scrollbar.grid(row=8, column=3, sticky="ns")
+        self.log.configure(yscrollcommand=scrollbar.set)
+
+    def select_pdf(self):
+        path = filedialog.askopenfilename(
+            title="Select PDF",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if path:
+            self.pdf_path.set(path)
+            if not self.output_dir.get():
+                pdf = Path(path)
+                self.output_dir.set(str(pdf.with_suffix("")))
+
+    def select_output_dir(self):
+        path = filedialog.askdirectory(title="Select output folder")
+        if path:
+            self.output_dir.set(path)
+
+    def detect_hardware_text(self):
+        renderer = self.find_d2d_renderer()
+        prefix = "Direct2D GPU renderer available. " if renderer else "Direct2D GPU renderer missing; MuPDF CPU fallback available. "
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if names:
+                intel_names = [name for name in names if "intel" in name.lower()]
+                if intel_names:
+                    return prefix + "Intel GPU detected: " + ", ".join(intel_names)
+                return prefix + "GPU detected: " + ", ".join(names)
+        except Exception:
+            pass
+        return prefix + "GPU detection unavailable."
+
+    def start_conversion(self):
+        if self.worker and self.worker.is_alive():
+            return
+
+        pdf = Path(self.pdf_path.get().strip())
+        output = Path(self.output_dir.get().strip())
+        dpi = self.dpi.get()
+
+        if not pdf.is_file():
+            messagebox.showerror("Missing PDF", "Please select an existing PDF file.")
+            return
+        if pdf.suffix.lower() != ".pdf":
+            messagebox.showerror("Invalid file", "Please select a PDF file.")
+            return
+        if dpi < 72 or dpi > 600:
+            messagebox.showerror("Invalid DPI", "Choose a DPI between 72 and 600.")
+            return
+
+        renderer = self.find_d2d_renderer()
+        mutool = self.find_mutool()
+        if not renderer and not mutool:
+            messagebox.showerror(
+                "Renderer not found",
+                "Could not find Direct2DRenderer\\GpuPdfRenderer.exe or MuPDF\\mutool.exe.",
+            )
+            return
+
+        output.mkdir(parents=True, exist_ok=True)
+        self.cancel_requested = False
+        self.started_at = time.time()
+        self.start_button.configure(state=tk.DISABLED)
+        self.cancel_button.configure(state=tk.NORMAL)
+        self.progress.start(12)
+        self.clear_log()
+
+        self.worker = threading.Thread(
+            target=self.convert_pdf,
+            args=(renderer, mutool, pdf, output, dpi),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def cancel_conversion(self):
+        self.cancel_requested = True
+        self.status.set("Cancelling...")
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+            except Exception:
+                pass
+
+    def find_mutool(self):
+        if LOCAL_MUTOOL.is_file():
+            return str(LOCAL_MUTOOL)
+        return shutil.which("mutool")
+
+    def find_d2d_renderer(self):
+        if LOCAL_D2D_RENDERER.is_file():
+            return str(LOCAL_D2D_RENDERER)
+        return shutil.which("GpuPdfRenderer")
+
+    def convert_pdf(self, renderer, mutool, pdf, output, dpi):
+        base_name = self.safe_stem(pdf.stem)
+        if renderer:
+            command = [
+                renderer,
+                "--input",
+                str(pdf),
+                "--output",
+                str(output),
+                "--dpi",
+                str(dpi),
+                "--prefix",
+                base_name + "_page_",
+            ]
+            engine_text = "Windows Direct2D GPU renderer: " + renderer
+            mode_text = "Rendering mode: Windows PDF API + Direct2D helper."
+        else:
+            pattern = output / f"{base_name}_page_%04d.png"
+            command = [
+                mutool,
+                "draw",
+                "-o",
+                str(pattern),
+                "-r",
+                str(dpi),
+                str(pdf),
+            ]
+            engine_text = "MuPDF CPU fallback: " + mutool
+            mode_text = "Rendering mode: CPU via MuPDF; Direct2D helper was not found."
+
+        self.events.put(("status", "Starting conversion..."))
+        self.events.put(("log", "Input PDF: " + str(pdf)))
+        self.events.put(("log", "Output folder: " + str(output)))
+        self.events.put(("log", "DPI: " + str(dpi)))
+        self.events.put(("log", "Engine: " + engine_text))
+        self.events.put(("log", mode_text))
+        self.events.put(("log", self.gpu_status.get()))
+
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+
+            assert self.process.stdout is not None
+            for line in self.process.stdout:
+                clean = line.strip()
+                if clean:
+                    self.events.put(("log", clean))
+                if self.cancel_requested:
+                    break
+
+            return_code = self.process.wait()
+            if self.cancel_requested:
+                self.events.put(("done", False, "Cancelled."))
+                return
+            if return_code != 0:
+                self.events.put(("done", False, f"Conversion failed with exit code {return_code}."))
+                return
+
+            png_count = len(list(output.glob(f"{base_name}_page_*.png")))
+            elapsed = time.time() - self.started_at if self.started_at else 0
+            self.events.put(("done", True, f"Done. Created {png_count} PNG file(s) in {elapsed:.1f}s."))
+        except Exception as exc:
+            self.events.put(("done", False, "Error: " + str(exc)))
+        finally:
+            self.process = None
+
+    def poll_events(self):
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind = event[0]
+                if kind == "status":
+                    self.status.set(event[1])
+                elif kind == "log":
+                    self.append_log(event[1])
+                elif kind == "done":
+                    success, message = event[1], event[2]
+                    self.progress.stop()
+                    self.start_button.configure(state=tk.NORMAL)
+                    self.cancel_button.configure(state=tk.DISABLED)
+                    self.status.set(message)
+                    self.append_log(message)
+                    if success:
+                        messagebox.showinfo("PDF to PNG", message)
+                    else:
+                        messagebox.showwarning("PDF to PNG", message)
+        except queue.Empty:
+            pass
+        self.after(100, self.poll_events)
+
+    def append_log(self, text):
+        self.log.configure(state=tk.NORMAL)
+        self.log.insert(tk.END, text + "\n")
+        self.log.see(tk.END)
+        self.log.configure(state=tk.DISABLED)
+
+    def clear_log(self):
+        self.log.configure(state=tk.NORMAL)
+        self.log.delete("1.0", tk.END)
+        self.log.configure(state=tk.DISABLED)
+
+    @staticmethod
+    def safe_stem(stem):
+        allowed = []
+        for char in stem:
+            if char.isalnum() or char in ("-", "_"):
+                allowed.append(char)
+            else:
+                allowed.append("_")
+        result = "".join(allowed).strip("_")
+        return result or "page"
+
+
+if __name__ == "__main__":
+    app = PdfToPngApp()
+    app.mainloop()
