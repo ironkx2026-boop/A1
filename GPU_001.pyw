@@ -1,4 +1,6 @@
+import concurrent.futures
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -32,6 +34,8 @@ class PdfToPngApp(tk.Tk):
 
         self.worker = None
         self.process = None
+        self.child_processes = []
+        self.process_lock = threading.Lock()
         self.cancel_requested = False
         self.events = queue.Queue()
         self.started_at = None
@@ -181,11 +185,14 @@ class PdfToPngApp(tk.Tk):
     def cancel_conversion(self):
         self.cancel_requested = True
         self.status.set("Cancelling...")
-        if self.process and self.process.poll() is None:
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
+        with self.process_lock:
+            processes = [self.process] + list(self.child_processes)
+        for process in processes:
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
 
     def find_mutool(self):
         if LOCAL_MUTOOL.is_file():
@@ -301,7 +308,7 @@ class PdfToPngApp(tk.Tk):
                 return
 
             final_pdf = output / f"{base_name}_OCR_eng_ell.pdf"
-            if not self.create_searchable_pdf(tesseract, png_files, final_pdf):
+            if not self.create_searchable_pdf(tesseract, mutool, png_files, final_pdf):
                 return
 
             elapsed = time.time() - self.started_at if self.started_at else 0
@@ -317,55 +324,65 @@ class PdfToPngApp(tk.Tk):
         finally:
             self.process = None
 
-    def create_searchable_pdf(self, tesseract, png_files, final_pdf):
+    def create_searchable_pdf(self, tesseract, mutool, png_files, final_pdf):
         self.events.put(("status", "Running OCR and building searchable PDF..."))
         self.events.put(("log", f"OCR input pages: {len(png_files)}"))
+        worker_count = max(1, min(os.cpu_count() or 1, len(png_files)))
+        self.events.put(("log", f"OCR parallelism: {worker_count} page worker(s), one CPU thread each."))
         self.events.put(("log", "Final searchable PDF: " + str(final_pdf)))
 
-        list_file = final_pdf.with_suffix(".pages.txt")
-        output_base = final_pdf.with_suffix("")
+        if not mutool:
+            self.events.put(("done", False, "MuPDF mutool.exe is required to merge per-page OCR PDFs."))
+            return False
+
+        page_pdf_dir = final_pdf.parent / (final_pdf.stem + "_pages")
         try:
-            list_file.write_text("\n".join(str(path) for path in png_files), encoding="utf-8")
+            if page_pdf_dir.exists():
+                shutil.rmtree(page_pdf_dir)
+            page_pdf_dir.mkdir(parents=True, exist_ok=True)
             if final_pdf.exists():
                 final_pdf.unlink()
 
-            command = [
-                tesseract,
-                str(list_file),
-                str(output_base),
-                "-l",
-                OCR_LANGUAGES,
-            ]
-            if LOCAL_TESSDATA.is_dir():
-                command.extend(["--tessdata-dir", str(LOCAL_TESSDATA)])
-            command.append("pdf")
+            page_pdfs = [None] * len(png_files)
+            completed = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(self.ocr_one_page, tesseract, image_path, page_pdf_dir, index): index
+                    for index, image_path in enumerate(png_files)
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    index = futures[future]
+                    if self.cancel_requested:
+                        break
+                    ok, page_pdf, message = future.result()
+                    if not ok:
+                        self.events.put(("done", False, message))
+                        return False
+                    page_pdfs[index] = page_pdf
+                    completed += 1
+                    self.events.put(("log", f"OCR page {index + 1}/{len(png_files)} done."))
+                    self.events.put(("status", f"OCR pages: {completed}/{len(png_files)}"))
 
-            self.process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-
-            assert self.process.stdout is not None
-            for line in self.process.stdout:
-                clean = line.strip()
-                if clean:
-                    self.events.put(("log", "OCR: " + clean))
                 if self.cancel_requested:
-                    break
+                    self.events.put(("done", False, "Cancelled."))
+                    return False
 
-            return_code = self.process.wait()
-            if self.cancel_requested:
-                self.events.put(("done", False, "Cancelled."))
+            missing = [index + 1 for index, path in enumerate(page_pdfs) if not path or not Path(path).is_file()]
+            if missing:
+                self.events.put(("done", False, "OCR failed; missing page PDF(s): " + ", ".join(map(str, missing))))
                 return False
+
+            self.events.put(("status", "Merging OCR pages into final PDF..."))
+            merge_command = [mutool, "merge", "-o", str(final_pdf)]
+            merge_command.extend(str(path) for path in page_pdfs)
+            return_code, output = self.run_child_process(merge_command)
+            for line in output:
+                self.events.put(("log", "Merge: " + line))
             if return_code != 0:
-                self.events.put(("done", False, f"OCR failed with exit code {return_code}."))
+                self.events.put(("done", False, f"PDF merge failed with exit code {return_code}."))
                 return False
             if not final_pdf.is_file():
-                self.events.put(("done", False, "OCR finished, but the searchable PDF was not created."))
+                self.events.put(("done", False, "Merge finished, but the searchable PDF was not created."))
                 return False
 
             self.events.put(("log", "OCR searchable PDF created: " + str(final_pdf)))
@@ -375,9 +392,66 @@ class PdfToPngApp(tk.Tk):
             return False
         finally:
             try:
-                list_file.unlink(missing_ok=True)
+                shutil.rmtree(page_pdf_dir, ignore_errors=True)
             except Exception:
                 pass
+
+    def ocr_one_page(self, tesseract, image_path, page_pdf_dir, index):
+        output_base = page_pdf_dir / f"ocr_page_{index + 1:04d}"
+        page_pdf = output_base.with_suffix(".pdf")
+        command = [
+            tesseract,
+            str(image_path),
+            str(output_base),
+            "-l",
+            OCR_LANGUAGES,
+        ]
+        if LOCAL_TESSDATA.is_dir():
+            command.extend(["--tessdata-dir", str(LOCAL_TESSDATA)])
+        command.append("pdf")
+
+        env = os.environ.copy()
+        env["OMP_THREAD_LIMIT"] = "1"
+
+        return_code, output = self.run_child_process(command, env=env)
+        if return_code != 0:
+            detail = "; ".join(output[-3:]) if output else "no OCR output"
+            return False, None, f"OCR page {index + 1} failed with exit code {return_code}: {detail}"
+        if not page_pdf.is_file():
+            return False, None, f"OCR page {index + 1} finished, but no page PDF was created."
+        return True, page_pdf, ""
+
+    def run_child_process(self, command, env=None):
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        with self.process_lock:
+            self.child_processes.append(process)
+
+        output = []
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                clean = line.strip()
+                if clean:
+                    output.append(clean)
+                if self.cancel_requested and process.poll() is None:
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    break
+            return process.wait(), output
+        finally:
+            with self.process_lock:
+                if process in self.child_processes:
+                    self.child_processes.remove(process)
 
     def monitor_renderer_gpu(self, pid, stop_event, stats):
         pid_text = f"pid_{pid}_"
