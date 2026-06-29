@@ -1,3 +1,4 @@
+import json
 import queue
 import shutil
 import subprocess
@@ -231,6 +232,18 @@ class PdfToPngApp(tk.Tk):
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
 
+            gpu_stop = threading.Event()
+            gpu_stats = {"samples": 0, "nonzero": 0, "max": 0.0, "engine": ""}
+            gpu_monitor = None
+            if renderer:
+                self.events.put(("log", f"GPU monitor: watching renderer PID {self.process.pid}."))
+                gpu_monitor = threading.Thread(
+                    target=self.monitor_renderer_gpu,
+                    args=(self.process.pid, gpu_stop, gpu_stats),
+                    daemon=True,
+                )
+                gpu_monitor.start()
+
             assert self.process.stdout is not None
             for line in self.process.stdout:
                 clean = line.strip()
@@ -240,6 +253,20 @@ class PdfToPngApp(tk.Tk):
                     break
 
             return_code = self.process.wait()
+            if renderer:
+                gpu_stop.set()
+                if gpu_monitor:
+                    gpu_monitor.join(timeout=2)
+                self.events.put(
+                    (
+                        "log",
+                        "GPU monitor: "
+                        + f"{gpu_stats['nonzero']} active sample(s), "
+                        + f"max {gpu_stats['max']:.2f}%"
+                        + (f" on {gpu_stats['engine']}" if gpu_stats["engine"] else "")
+                        + ".",
+                    )
+                )
             if self.cancel_requested:
                 self.events.put(("done", False, "Cancelled."))
                 return
@@ -254,6 +281,45 @@ class PdfToPngApp(tk.Tk):
             self.events.put(("done", False, "Error: " + str(exc)))
         finally:
             self.process = None
+
+    def monitor_renderer_gpu(self, pid, stop_event, stats):
+        pid_text = f"pid_{pid}_"
+        command = (
+            "$samples = (Get-Counter '\\GPU Engine(*)\\Utilization Percentage').CounterSamples "
+            f"| Where-Object {{ $_.Path -like '*{pid_text}*' }} "
+            "| ForEach-Object { "
+            "[pscustomobject]@{ "
+            "Engine=(($_.Path -replace '^.*engtype_','') -replace '\\\\utilization percentage$',''); "
+            "Value=$_.CookedValue "
+            "} }; "
+            "$samples | ConvertTo-Json -Compress"
+        )
+
+        while not stop_event.is_set():
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", command],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                text = result.stdout.strip()
+                if text:
+                    parsed = json.loads(text)
+                    rows = parsed if isinstance(parsed, list) else [parsed]
+                    for row in rows:
+                        value = float(row.get("Value", 0) or 0)
+                        engine = str(row.get("Engine", "") or "").strip(")")
+                        stats["samples"] += 1
+                        if value > 0.01:
+                            stats["nonzero"] += 1
+                        if value > stats["max"]:
+                            stats["max"] = value
+                            stats["engine"] = engine
+            except Exception:
+                pass
+            stop_event.wait(0.2)
 
     def poll_events(self):
         try:
