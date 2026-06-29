@@ -224,7 +224,17 @@ class PdfToPngApp(tk.Tk):
 
     def convert_batch(self, renderer, mutool, tesseract, pdfs, output, dpi):
         batch_start = time.time()
+        start_text = self.format_timestamp(batch_start)
+        totals = {
+            "pdfs": len(pdfs),
+            "completed_pdfs": 0,
+            "pages": 0,
+            "render_seconds": 0.0,
+            "ocr_seconds": 0.0,
+            "rerender_seconds": 0.0,
+        }
         self.events.put(("log", f"Batch: {len(pdfs)} PDF file(s)."))
+        self.events.put(("log", f"Time start: {start_text}"))
         completed = 0
         for index, pdf in enumerate(pdfs, start=1):
             if self.cancel_requested:
@@ -232,15 +242,36 @@ class PdfToPngApp(tk.Tk):
                 return
             self.events.put(("log", ""))
             self.events.put(("log", f"=== PDF {index}/{len(pdfs)}: {pdf.name} ==="))
-            ok = self.convert_pdf(renderer, mutool, tesseract, pdf, output, dpi, batch_index=index, batch_total=len(pdfs))
+            ok, metrics = self.convert_pdf(
+                renderer,
+                mutool,
+                tesseract,
+                pdf,
+                output,
+                dpi,
+                batch_index=index,
+                batch_total=len(pdfs),
+            )
             if not ok:
                 return
             completed += 1
+            totals["completed_pdfs"] = completed
+            totals["pages"] += metrics["pages"]
+            totals["render_seconds"] += metrics["render_seconds"]
+            totals["ocr_seconds"] += metrics["ocr_seconds"]
+            totals["rerender_seconds"] += metrics["rerender_seconds"]
 
-        elapsed = time.time() - batch_start
-        self.events.put(("done", True, f"Batch done. Completed {completed}/{len(pdfs)} PDF file(s) in {elapsed:.1f}s."))
+        finish = time.time()
+        summary = self.format_batch_summary(totals, batch_start, finish)
+        self.events.put(("done", True, summary))
 
     def convert_pdf(self, renderer, mutool, tesseract, pdf, output, dpi, batch_index=1, batch_total=1):
+        metrics = {
+            "pages": 0,
+            "render_seconds": 0.0,
+            "ocr_seconds": 0.0,
+            "rerender_seconds": 0.0,
+        }
         base_name = self.safe_stem(pdf.stem)
         if renderer:
             command = [
@@ -281,6 +312,7 @@ class PdfToPngApp(tk.Tk):
 
         try:
             self.events.put(("status", f"Rendering PDF {batch_index}/{batch_total} to PNG..."))
+            render_start = time.time()
             self.process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
@@ -311,6 +343,7 @@ class PdfToPngApp(tk.Tk):
                     break
 
             return_code = self.process.wait()
+            metrics["render_seconds"] = time.time() - render_start
             if renderer:
                 gpu_stop.set()
                 if gpu_monitor:
@@ -327,31 +360,44 @@ class PdfToPngApp(tk.Tk):
                 )
             if self.cancel_requested:
                 self.events.put(("done", False, "Cancelled."))
-                return False
+                return False, metrics
             if return_code != 0:
                 self.events.put(("done", False, f"Conversion failed with exit code {return_code}."))
-                return False
+                return False, metrics
 
             png_files = sorted(output.glob(f"{base_name}_page_*.png"))
             png_count = len(png_files)
+            metrics["pages"] = png_count
             if png_count == 0:
                 self.events.put(("done", False, "No PNG pages were created, so OCR could not continue."))
-                return False
+                return False, metrics
 
             final_pdf = output / f"{base_name}_OCR_eng_ell.pdf"
-            if not self.create_searchable_pdf(tesseract, mutool, png_files, final_pdf):
-                return False
+            ok, ocr_metrics = self.create_searchable_pdf(tesseract, mutool, png_files, final_pdf)
+            metrics["ocr_seconds"] = ocr_metrics["ocr_seconds"]
+            metrics["rerender_seconds"] = ocr_metrics["rerender_seconds"]
+            if not ok:
+                return False, metrics
 
-            elapsed = time.time() - self.started_at if self.started_at else 0
-            self.events.put(("log", f"PDF {batch_index}/{batch_total} done. Created {png_count} PNG file(s): {final_pdf}"))
-            return True
+            pdf_total = metrics["render_seconds"] + metrics["ocr_seconds"] + metrics["rerender_seconds"]
+            self.events.put(
+                (
+                    "log",
+                    f"PDF {batch_index}/{batch_total} done. "
+                    + f"Pages: {png_count}; render {metrics['render_seconds']:.1f}s; "
+                    + f"OCR {metrics['ocr_seconds']:.1f}s; re-render {metrics['rerender_seconds']:.1f}s; "
+                    + f"total {pdf_total:.1f}s: {final_pdf}",
+                )
+            )
+            return True, metrics
         except Exception as exc:
             self.events.put(("done", False, "Error: " + str(exc)))
-            return False
+            return False, metrics
         finally:
             self.process = None
 
     def create_searchable_pdf(self, tesseract, mutool, png_files, final_pdf):
+        metrics = {"ocr_seconds": 0.0, "rerender_seconds": 0.0}
         self.events.put(("status", "Running OCR and building searchable PDF..."))
         self.events.put(("log", f"OCR input pages: {len(png_files)}"))
         worker_count = max(1, min(os.cpu_count() or 1, len(png_files)))
@@ -360,7 +406,7 @@ class PdfToPngApp(tk.Tk):
 
         if not mutool:
             self.events.put(("done", False, "MuPDF mutool.exe is required to merge per-page OCR PDFs."))
-            return False
+            return False, metrics
 
         page_pdf_dir = final_pdf.parent / (final_pdf.stem + "_pages")
         try:
@@ -372,6 +418,7 @@ class PdfToPngApp(tk.Tk):
 
             page_pdfs = [None] * len(png_files)
             completed = 0
+            ocr_start = time.time()
             with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {
                     executor.submit(self.ocr_one_page, tesseract, image_path, page_pdf_dir, index): index
@@ -384,7 +431,8 @@ class PdfToPngApp(tk.Tk):
                     ok, page_pdf, message = future.result()
                     if not ok:
                         self.events.put(("done", False, message))
-                        return False
+                        metrics["ocr_seconds"] = time.time() - ocr_start
+                        return False, metrics
                     page_pdfs[index] = page_pdf
                     completed += 1
                     self.events.put(("log", f"OCR page {index + 1}/{len(png_files)} done."))
@@ -392,31 +440,35 @@ class PdfToPngApp(tk.Tk):
 
                 if self.cancel_requested:
                     self.events.put(("done", False, "Cancelled."))
-                    return False
+                    metrics["ocr_seconds"] = time.time() - ocr_start
+                    return False, metrics
+            metrics["ocr_seconds"] = time.time() - ocr_start
 
             missing = [index + 1 for index, path in enumerate(page_pdfs) if not path or not Path(path).is_file()]
             if missing:
                 self.events.put(("done", False, "OCR failed; missing page PDF(s): " + ", ".join(map(str, missing))))
-                return False
+                return False, metrics
 
             self.events.put(("status", "Merging OCR pages into final PDF..."))
             merge_command = [mutool, "merge", "-o", str(final_pdf)]
             merge_command.extend(str(path) for path in page_pdfs)
+            rerender_start = time.time()
             return_code, output = self.run_child_process(merge_command)
+            metrics["rerender_seconds"] = time.time() - rerender_start
             for line in output:
                 self.events.put(("log", "Merge: " + line))
             if return_code != 0:
                 self.events.put(("done", False, f"PDF merge failed with exit code {return_code}."))
-                return False
+                return False, metrics
             if not final_pdf.is_file():
                 self.events.put(("done", False, "Merge finished, but the searchable PDF was not created."))
-                return False
+                return False, metrics
 
             self.events.put(("log", "OCR searchable PDF created: " + str(final_pdf)))
-            return True
+            return True, metrics
         except Exception as exc:
             self.events.put(("done", False, "OCR error: " + str(exc)))
-            return False
+            return False, metrics
         finally:
             try:
                 shutil.rmtree(page_pdf_dir, ignore_errors=True)
@@ -518,6 +570,38 @@ class PdfToPngApp(tk.Tk):
             except Exception:
                 pass
             stop_event.wait(0.2)
+
+    @staticmethod
+    def format_timestamp(timestamp):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+    def format_batch_summary(self, totals, start, finish):
+        pages = totals["pages"]
+        total_seconds = finish - start
+        render_avg = self.seconds_per_page(totals["render_seconds"], pages)
+        ocr_avg = self.seconds_per_page(totals["ocr_seconds"], pages)
+        rerender_avg = self.seconds_per_page(totals["rerender_seconds"], pages)
+        total_avg = self.seconds_per_page(total_seconds, pages)
+
+        return (
+            "Batch done.\n"
+            + f"Total PDFs: {totals['completed_pdfs']}/{totals['pdfs']}\n"
+            + f"Total pages: {pages}\n"
+            + f"Time start: {self.format_timestamp(start)}\n"
+            + f"Time finish: {self.format_timestamp(finish)}\n"
+            + "\n"
+            + "Average time per page:\n"
+            + f"Render: {render_avg:.3f}s\n"
+            + f"OCR: {ocr_avg:.3f}s\n"
+            + f"Re Render: {rerender_avg:.3f}s\n"
+            + f"Total: {total_avg:.3f}s"
+        )
+
+    @staticmethod
+    def seconds_per_page(seconds, pages):
+        if pages <= 0:
+            return 0.0
+        return seconds / pages
 
     def poll_events(self):
         try:
