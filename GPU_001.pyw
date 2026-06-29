@@ -12,6 +12,9 @@ from tkinter import filedialog, messagebox, ttk
 APP_DIR = Path(__file__).resolve().parent
 LOCAL_MUTOOL = APP_DIR / "MuPDF" / "mutool.exe"
 LOCAL_D2D_RENDERER = APP_DIR / "Direct2DRenderer" / "GpuPdfRenderer.exe"
+LOCAL_TESSERACT = APP_DIR / "Tesseract-OCR" / "tesseract.exe"
+LOCAL_TESSDATA = APP_DIR / "Tesseract-OCR" / "tessdata"
+OCR_LANGUAGES = "eng+ell"
 
 
 class PdfToPngApp(tk.Tk):
@@ -40,9 +43,9 @@ class PdfToPngApp(tk.Tk):
         root = ttk.Frame(self, padding=16)
         root.pack(fill=tk.BOTH, expand=True)
         root.columnconfigure(1, weight=1)
-        root.rowconfigure(6, weight=1)
+        root.rowconfigure(9, weight=1)
 
-        title = ttk.Label(root, text="Convert every PDF page to PNG", font=("Segoe UI", 16, "bold"))
+        title = ttk.Label(root, text="Convert PDF to PNG and searchable OCR PDF", font=("Segoe UI", 16, "bold"))
         title.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
 
         ttk.Label(root, text="PDF file").grid(row=1, column=0, sticky="w", pady=6)
@@ -59,26 +62,29 @@ class PdfToPngApp(tk.Tk):
         ttk.Spinbox(dpi_frame, from_=72, to=600, increment=25, textvariable=self.dpi, width=8).pack(side=tk.LEFT)
         ttk.Label(dpi_frame, text="DPI").pack(side=tk.LEFT, padx=(8, 0))
 
-        ttk.Label(root, text="Hardware").grid(row=4, column=0, sticky="w", pady=6)
-        ttk.Label(root, textvariable=self.gpu_status).grid(row=4, column=1, columnspan=2, sticky="w", padx=8, pady=6)
+        ttk.Label(root, text="OCR").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Label(root, text=f"Tesseract languages: {OCR_LANGUAGES}").grid(row=4, column=1, columnspan=2, sticky="w", padx=8, pady=6)
+
+        ttk.Label(root, text="Hardware").grid(row=5, column=0, sticky="w", pady=6)
+        ttk.Label(root, textvariable=self.gpu_status).grid(row=5, column=1, columnspan=2, sticky="w", padx=8, pady=6)
 
         button_frame = ttk.Frame(root)
-        button_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 8))
+        button_frame.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 8))
         self.start_button = ttk.Button(button_frame, text="Start", command=self.start_conversion)
         self.start_button.pack(side=tk.LEFT)
         self.cancel_button = ttk.Button(button_frame, text="Cancel", command=self.cancel_conversion, state=tk.DISABLED)
         self.cancel_button.pack(side=tk.LEFT, padx=(8, 0))
 
         self.progress = ttk.Progressbar(root, mode="indeterminate")
-        self.progress.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        self.progress.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 
-        ttk.Label(root, textvariable=self.status).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(root, textvariable=self.status).grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         self.log = tk.Text(root, height=12, wrap=tk.WORD, state=tk.DISABLED)
-        self.log.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        self.log.grid(row=9, column=0, columnspan=3, sticky="nsew")
 
         scrollbar = ttk.Scrollbar(root, orient=tk.VERTICAL, command=self.log.yview)
-        scrollbar.grid(row=8, column=3, sticky="ns")
+        scrollbar.grid(row=9, column=3, sticky="ns")
         self.log.configure(yscrollcommand=scrollbar.set)
 
     def select_pdf(self):
@@ -143,10 +149,17 @@ class PdfToPngApp(tk.Tk):
 
         renderer = self.find_d2d_renderer()
         mutool = self.find_mutool()
+        tesseract = self.find_tesseract()
         if not renderer and not mutool:
             messagebox.showerror(
                 "Renderer not found",
                 "Could not find Direct2DRenderer\\GpuPdfRenderer.exe or MuPDF\\mutool.exe.",
+            )
+            return
+        if not tesseract:
+            messagebox.showerror(
+                "Tesseract not found",
+                "Could not find Tesseract-OCR\\tesseract.exe or tesseract.exe in PATH.",
             )
             return
 
@@ -160,7 +173,7 @@ class PdfToPngApp(tk.Tk):
 
         self.worker = threading.Thread(
             target=self.convert_pdf,
-            args=(renderer, mutool, pdf, output, dpi),
+            args=(renderer, mutool, tesseract, pdf, output, dpi),
             daemon=True,
         )
         self.worker.start()
@@ -184,7 +197,12 @@ class PdfToPngApp(tk.Tk):
             return str(LOCAL_D2D_RENDERER)
         return shutil.which("GpuPdfRenderer")
 
-    def convert_pdf(self, renderer, mutool, pdf, output, dpi):
+    def find_tesseract(self):
+        if LOCAL_TESSERACT.is_file():
+            return str(LOCAL_TESSERACT)
+        return shutil.which("tesseract")
+
+    def convert_pdf(self, renderer, mutool, tesseract, pdf, output, dpi):
         base_name = self.safe_stem(pdf.stem)
         if renderer:
             command = [
@@ -220,9 +238,11 @@ class PdfToPngApp(tk.Tk):
         self.events.put(("log", "DPI: " + str(dpi)))
         self.events.put(("log", "Engine: " + engine_text))
         self.events.put(("log", mode_text))
+        self.events.put(("log", f"OCR: Tesseract {OCR_LANGUAGES}; final PDF will be searchable with Ctrl+F."))
         self.events.put(("log", self.gpu_status.get()))
 
         try:
+            self.events.put(("status", "Rendering pages to PNG..."))
             self.process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
@@ -274,13 +294,90 @@ class PdfToPngApp(tk.Tk):
                 self.events.put(("done", False, f"Conversion failed with exit code {return_code}."))
                 return
 
-            png_count = len(list(output.glob(f"{base_name}_page_*.png")))
+            png_files = sorted(output.glob(f"{base_name}_page_*.png"))
+            png_count = len(png_files)
+            if png_count == 0:
+                self.events.put(("done", False, "No PNG pages were created, so OCR could not continue."))
+                return
+
+            final_pdf = output / f"{base_name}_OCR_eng_ell.pdf"
+            if not self.create_searchable_pdf(tesseract, png_files, final_pdf):
+                return
+
             elapsed = time.time() - self.started_at if self.started_at else 0
-            self.events.put(("done", True, f"Done. Created {png_count} PNG file(s) in {elapsed:.1f}s."))
+            self.events.put(
+                (
+                    "done",
+                    True,
+                    f"Done. Created {png_count} PNG file(s) and searchable PDF in {elapsed:.1f}s: {final_pdf}",
+                )
+            )
         except Exception as exc:
             self.events.put(("done", False, "Error: " + str(exc)))
         finally:
             self.process = None
+
+    def create_searchable_pdf(self, tesseract, png_files, final_pdf):
+        self.events.put(("status", "Running OCR and building searchable PDF..."))
+        self.events.put(("log", f"OCR input pages: {len(png_files)}"))
+        self.events.put(("log", "Final searchable PDF: " + str(final_pdf)))
+
+        list_file = final_pdf.with_suffix(".pages.txt")
+        output_base = final_pdf.with_suffix("")
+        try:
+            list_file.write_text("\n".join(str(path) for path in png_files), encoding="utf-8")
+            if final_pdf.exists():
+                final_pdf.unlink()
+
+            command = [
+                tesseract,
+                str(list_file),
+                str(output_base),
+                "-l",
+                OCR_LANGUAGES,
+            ]
+            if LOCAL_TESSDATA.is_dir():
+                command.extend(["--tessdata-dir", str(LOCAL_TESSDATA)])
+            command.append("pdf")
+
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+
+            assert self.process.stdout is not None
+            for line in self.process.stdout:
+                clean = line.strip()
+                if clean:
+                    self.events.put(("log", "OCR: " + clean))
+                if self.cancel_requested:
+                    break
+
+            return_code = self.process.wait()
+            if self.cancel_requested:
+                self.events.put(("done", False, "Cancelled."))
+                return False
+            if return_code != 0:
+                self.events.put(("done", False, f"OCR failed with exit code {return_code}."))
+                return False
+            if not final_pdf.is_file():
+                self.events.put(("done", False, "OCR finished, but the searchable PDF was not created."))
+                return False
+
+            self.events.put(("log", "OCR searchable PDF created: " + str(final_pdf)))
+            return True
+        except Exception as exc:
+            self.events.put(("done", False, "OCR error: " + str(exc)))
+            return False
+        finally:
+            try:
+                list_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def monitor_renderer_gpu(self, pid, stop_event, stats):
         pid_text = f"pid_{pid}_"
