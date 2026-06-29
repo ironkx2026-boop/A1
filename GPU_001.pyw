@@ -26,10 +26,11 @@ class PdfToPngApp(tk.Tk):
         self.geometry("780x520")
         self.minsize(720, 480)
 
-        self.pdf_path = tk.StringVar()
+        self.pdf_paths = []
+        self.pdf_summary = tk.StringVar(value="No PDFs selected.")
         self.output_dir = tk.StringVar()
         self.dpi = tk.IntVar(value=300)
-        self.status = tk.StringVar(value="Select a PDF and an output folder.")
+        self.status = tk.StringVar(value="Select one or more PDFs and an output folder.")
         self.gpu_status = tk.StringVar(value=self.detect_hardware_text())
 
         self.worker = None
@@ -52,9 +53,9 @@ class PdfToPngApp(tk.Tk):
         title = ttk.Label(root, text="Convert PDF to PNG and searchable OCR PDF", font=("Segoe UI", 16, "bold"))
         title.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
 
-        ttk.Label(root, text="PDF file").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(root, textvariable=self.pdf_path).grid(row=1, column=1, sticky="ew", padx=8, pady=6)
-        ttk.Button(root, text="Select PDF", command=self.select_pdf).grid(row=1, column=2, sticky="ew", pady=6)
+        ttk.Label(root, text="PDF files").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(root, textvariable=self.pdf_summary, state="readonly").grid(row=1, column=1, sticky="ew", padx=8, pady=6)
+        ttk.Button(root, text="Select PDFs", command=self.select_pdf).grid(row=1, column=2, sticky="ew", pady=6)
 
         ttk.Label(root, text="Output folder").grid(row=2, column=0, sticky="w", pady=6)
         ttk.Entry(root, textvariable=self.output_dir).grid(row=2, column=1, sticky="ew", padx=8, pady=6)
@@ -92,15 +93,15 @@ class PdfToPngApp(tk.Tk):
         self.log.configure(yscrollcommand=scrollbar.set)
 
     def select_pdf(self):
-        path = filedialog.askopenfilename(
-            title="Select PDF",
+        paths = filedialog.askopenfilenames(
+            title="Select PDFs",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
-        if path:
-            self.pdf_path.set(path)
+        if paths:
+            self.pdf_paths = [Path(path) for path in paths]
+            self.pdf_summary.set(self.describe_selected_pdfs(self.pdf_paths))
             if not self.output_dir.get():
-                pdf = Path(path)
-                self.output_dir.set(str(pdf.with_suffix("")))
+                self.output_dir.set(str(self.pdf_paths[0].parent))
 
     def select_output_dir(self):
         path = filedialog.askdirectory(title="Select output folder")
@@ -137,16 +138,20 @@ class PdfToPngApp(tk.Tk):
         if self.worker and self.worker.is_alive():
             return
 
-        pdf = Path(self.pdf_path.get().strip())
+        pdfs = list(self.pdf_paths)
         output = Path(self.output_dir.get().strip())
         dpi = self.dpi.get()
 
-        if not pdf.is_file():
-            messagebox.showerror("Missing PDF", "Please select an existing PDF file.")
+        if not pdfs:
+            messagebox.showerror("Missing PDFs", "Please select one or more PDF files.")
             return
-        if pdf.suffix.lower() != ".pdf":
-            messagebox.showerror("Invalid file", "Please select a PDF file.")
-            return
+        for pdf in pdfs:
+            if not pdf.is_file():
+                messagebox.showerror("Missing PDF", f"File not found:\n{pdf}")
+                return
+            if pdf.suffix.lower() != ".pdf":
+                messagebox.showerror("Invalid file", f"Not a PDF file:\n{pdf}")
+                return
         if dpi < 72 or dpi > 600:
             messagebox.showerror("Invalid DPI", "Choose a DPI between 72 and 600.")
             return
@@ -176,11 +181,19 @@ class PdfToPngApp(tk.Tk):
         self.clear_log()
 
         self.worker = threading.Thread(
-            target=self.convert_pdf,
-            args=(renderer, mutool, tesseract, pdf, output, dpi),
+            target=self.convert_batch,
+            args=(renderer, mutool, tesseract, pdfs, output, dpi),
             daemon=True,
         )
         self.worker.start()
+
+    @staticmethod
+    def describe_selected_pdfs(pdfs):
+        if not pdfs:
+            return "No PDFs selected."
+        if len(pdfs) == 1:
+            return str(pdfs[0])
+        return f"{len(pdfs)} PDFs selected: {pdfs[0].name} ... {pdfs[-1].name}"
 
     def cancel_conversion(self):
         self.cancel_requested = True
@@ -209,7 +222,25 @@ class PdfToPngApp(tk.Tk):
             return str(LOCAL_TESSERACT)
         return shutil.which("tesseract")
 
-    def convert_pdf(self, renderer, mutool, tesseract, pdf, output, dpi):
+    def convert_batch(self, renderer, mutool, tesseract, pdfs, output, dpi):
+        batch_start = time.time()
+        self.events.put(("log", f"Batch: {len(pdfs)} PDF file(s)."))
+        completed = 0
+        for index, pdf in enumerate(pdfs, start=1):
+            if self.cancel_requested:
+                self.events.put(("done", False, "Cancelled."))
+                return
+            self.events.put(("log", ""))
+            self.events.put(("log", f"=== PDF {index}/{len(pdfs)}: {pdf.name} ==="))
+            ok = self.convert_pdf(renderer, mutool, tesseract, pdf, output, dpi, batch_index=index, batch_total=len(pdfs))
+            if not ok:
+                return
+            completed += 1
+
+        elapsed = time.time() - batch_start
+        self.events.put(("done", True, f"Batch done. Completed {completed}/{len(pdfs)} PDF file(s) in {elapsed:.1f}s."))
+
+    def convert_pdf(self, renderer, mutool, tesseract, pdf, output, dpi, batch_index=1, batch_total=1):
         base_name = self.safe_stem(pdf.stem)
         if renderer:
             command = [
@@ -239,7 +270,7 @@ class PdfToPngApp(tk.Tk):
             engine_text = "MuPDF CPU fallback: " + mutool
             mode_text = "Rendering mode: CPU via MuPDF; Direct2D helper was not found."
 
-        self.events.put(("status", "Starting conversion..."))
+        self.events.put(("status", f"Starting PDF {batch_index}/{batch_total}..."))
         self.events.put(("log", "Input PDF: " + str(pdf)))
         self.events.put(("log", "Output folder: " + str(output)))
         self.events.put(("log", "DPI: " + str(dpi)))
@@ -249,7 +280,7 @@ class PdfToPngApp(tk.Tk):
         self.events.put(("log", self.gpu_status.get()))
 
         try:
-            self.events.put(("status", "Rendering pages to PNG..."))
+            self.events.put(("status", f"Rendering PDF {batch_index}/{batch_total} to PNG..."))
             self.process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
@@ -296,31 +327,27 @@ class PdfToPngApp(tk.Tk):
                 )
             if self.cancel_requested:
                 self.events.put(("done", False, "Cancelled."))
-                return
+                return False
             if return_code != 0:
                 self.events.put(("done", False, f"Conversion failed with exit code {return_code}."))
-                return
+                return False
 
             png_files = sorted(output.glob(f"{base_name}_page_*.png"))
             png_count = len(png_files)
             if png_count == 0:
                 self.events.put(("done", False, "No PNG pages were created, so OCR could not continue."))
-                return
+                return False
 
             final_pdf = output / f"{base_name}_OCR_eng_ell.pdf"
             if not self.create_searchable_pdf(tesseract, mutool, png_files, final_pdf):
-                return
+                return False
 
             elapsed = time.time() - self.started_at if self.started_at else 0
-            self.events.put(
-                (
-                    "done",
-                    True,
-                    f"Done. Created {png_count} PNG file(s) and searchable PDF in {elapsed:.1f}s: {final_pdf}",
-                )
-            )
+            self.events.put(("log", f"PDF {batch_index}/{batch_total} done. Created {png_count} PNG file(s): {final_pdf}"))
+            return True
         except Exception as exc:
             self.events.put(("done", False, "Error: " + str(exc)))
+            return False
         finally:
             self.process = None
 
