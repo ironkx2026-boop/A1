@@ -1,0 +1,27 @@
+Command-line contract for GPUpdfTIF.exe
+
+Required arguments:
+
+--input <pdf-path>
+--output <output-folder-or-tif-path>
+
+Optional arguments:
+
+--dpi <integer>
+--prefix <filename-prefix>
+
+Behavior:
+
+- Render every PDF page with the Windows PDF API and Direct2D.
+- Save all pages into one multi-page TIFF file.
+- If --output ends in .tif or .tiff, use it as the exact TIFF path.
+- Otherwise, create the output folder if needed and save <prefix>multipage.tif there.
+- If --prefix is omitted, use the input PDF stem plus "_".
+- Print progress lines to stdout, one per page.
+- Return exit code 0 on success.
+- Return non-zero on failure.
+
+Examples:
+
+GPUpdfTIF.exe --input "C:\PROJECTS\OCR\sample.pdf" --output "C:\PROJECTS\OCR\GPU_test_output" --dpi 300 --prefix "sample_"
+GPUpdfTIF.exe --input "C:\PROJECTS\OCR\sample.pdf" --output "C:\PROJECTS\OCR\GPU_test_output\sample.tif" --dpi 300

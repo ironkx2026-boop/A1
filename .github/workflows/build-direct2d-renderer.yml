@@ -28,8 +28,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path Direct2DRenderer/artifact | Out-Null
           Copy-Item Direct2DRenderer/build/Release/GpuPdfRenderer.exe Direct2DRenderer/artifact/GpuPdfRenderer.exe
+          Copy-Item Direct2DRenderer/build/Release/GPUpdfTIF.exe Direct2DRenderer/artifact/GPUpdfTIF.exe
           Copy-Item Direct2DRenderer/README.md Direct2DRenderer/artifact/README.md
           Copy-Item Direct2DRenderer/GpuPdfRenderer.contract.txt Direct2DRenderer/artifact/GpuPdfRenderer.contract.txt
+          Copy-Item Direct2DRenderer/GPUpdfTIF.contract.txt Direct2DRenderer/artifact/GPUpdfTIF.contract.txt
 
       - name: Upload executable
         uses: actions/upload-artifact@v4

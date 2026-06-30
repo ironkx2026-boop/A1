@@ -50,3 +50,29 @@ C:\PROJECTS\OCR\Direct2DRenderer\GpuPdfRenderer.exe
 ```
 
 After that, `GPU_001.pyw` will prefer this Direct2D helper automatically. If the helper is missing, the GUI falls back to MuPDF CPU rendering.
+
+## Multi-page TIFF helper
+
+This project also builds:
+
+```text
+Direct2DRenderer\GPUpdfTIF.exe
+```
+
+It uses the same Windows PDF API + Direct2D render path, but writes all rendered pages into one multi-page TIFF:
+
+```powershell
+GPUpdfTIF.exe --input "C:\path\file.pdf" --output "C:\out" --dpi 300 --prefix "file_"
+```
+
+Expected output file:
+
+```text
+file_multipage.tif
+```
+
+You can also pass a full TIFF path as `--output`:
+
+```powershell
+GPUpdfTIF.exe --input "C:\path\file.pdf" --output "C:\out\file.tif" --dpi 300
+```
